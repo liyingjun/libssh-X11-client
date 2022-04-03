@@ -40,6 +40,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <stdio.h>
@@ -365,8 +366,9 @@ connect_local_xsocket_path(const char *pathname)
 		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "socket: %.100s", strerror(errno));
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, pathname, sizeof(addr.sun_path));
-	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+	addr.sun_path[0] = '\0';
+	strncpy(addr.sun_path + 1, pathname, strlen(pathname));
+	if (connect(sock, (struct sockaddr *)&addr, offsetof(struct sockaddr_un, sun_path) + 1 + strlen(pathname)) == 0)
 		return sock;
 	close(sock);
 	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "connect %.100s: %.100s", addr.sun_path, strerror(errno));
@@ -687,15 +689,19 @@ int main()
 	if (ret != SSH_OK) return ret;
 
 	if (enableX11 == 1) {
+		ssh_callbacks_init(&cb);
+		ssh_set_callbacks(session, &cb);
+
 		display = getenv("DISPLAY");
-
-		if (x11_get_proto(display, &proto, &cookie) == 0) {
-			ssh_callbacks_init(&cb);
-			ssh_set_callbacks(session, &cb);
-
-			ret = ssh_channel_request_x11(channel, 0, proto, cookie, 0);
-			if (ret != SSH_OK) return ret;
+		if (x11_get_proto(display, &proto, &cookie) != 0) {
+			_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Using fake authentication data for X11 forwarding");
+			proto = NULL;
+			cookie = NULL;
 		}
+
+		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "proto: %s - cookie: %s", proto, cookie);
+		ret = ssh_channel_request_x11(channel, 0, proto, cookie, 0);
+		if (ret != SSH_OK) return ret;
 	}
 
 	ret = _enter_term_raw_mode();
