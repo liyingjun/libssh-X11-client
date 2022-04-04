@@ -571,7 +571,6 @@ x11_open_request_callback(ssh_session session, const char *shost, int sport, voi
 	(void)userdata;
 
 	ssh_channel channel = ssh_channel_new(session);
-	ssh_channel_set_blocking(channel, 0);
 
 	int sock = x11_connect_display();
 
