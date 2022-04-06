@@ -60,6 +60,7 @@ typedef struct item {
 	ssh_channel channel;
 	int fd_in;
 	int fd_out;
+	int protected;
 	struct item *next;
 } node_t;
 
@@ -78,7 +79,7 @@ pthread_mutex_t mutex;
 */
 
 // Linked nodes to manage channel/fd tuples
-static void insert_item(ssh_channel channel, int fd_in, int fd_out);
+static void insert_item(ssh_channel channel, int fd_in, int fd_out, int protected);
 static void delete_item(ssh_channel channel);
 static node_t * search_item(ssh_channel channel);
 
@@ -209,7 +210,7 @@ _leave_term_raw_mode(void)
 */
 
 static void
-insert_item(ssh_channel channel, int fd_in, int fd_out)
+insert_item(ssh_channel channel, int fd_in, int fd_out, int protected)
 {
 	pthread_mutex_lock(&mutex);
 
@@ -220,6 +221,7 @@ insert_item(ssh_channel channel, int fd_in, int fd_out)
 		node->channel = channel;
 		node->fd_in = fd_in;
 		node->fd_out = fd_out;
+		node->protected = protected;
 		node->next = NULL;
 	} else {
 		node_iterator = node;
@@ -230,6 +232,7 @@ insert_item(ssh_channel channel, int fd_in, int fd_out)
 		new->channel = channel;
 		new->fd_in = fd_in;
 		new->fd_out = fd_out;
+		new->protected = protected;
 		new->next = NULL;
 		node_iterator->next = new;
 
@@ -481,11 +484,15 @@ copy_fd_to_channel_callback(int fd, int revents, void *userdata)
 	char buf[2097152];
 	int sz, ret = 0;
 
+	node_t *temp_node = search_item(channel);
+
 	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "event: %d - fd: %d", revents, fd);
 
 	if (!channel) {
 		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "channel does not exist.");
-		close(fd);
+		if (temp_node->protected == 0) {
+			close(fd);
+		}
 		return -1;
 	}
 
@@ -506,8 +513,10 @@ copy_fd_to_channel_callback(int fd, int revents, void *userdata)
 			return -1;
 		} else {
 			/* sz = 0. Why the hell I'm here? */
-			_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Why the hell I'm here?: sz: %d", sz);
-			close(fd);
+			_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Why the hell am I here?: sz: %d", sz);
+			if (temp_node->protected == 0) {
+				close(fd);
+			}
 			return -1;
 		}
 	}
@@ -556,7 +565,7 @@ channel_close_callback(ssh_session session, ssh_channel channel, void *userdata)
 		delete_item(channel);
 		ssh_event_remove_fd(event, fd);
 
-		if (fd !=0) {
+		if (temp_node->protected == 0) {
 			close(fd);
 		}
 	}
@@ -576,7 +585,7 @@ x11_open_request_callback(ssh_session session, const char *shost, int sport, voi
 
 	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "sock: %d", sock);
 
-	insert_item(channel, sock, sock);
+	insert_item(channel, sock, sock, 0);
 
 	ssh_event_add_fd(event, sock, events, copy_fd_to_channel_callback, channel);
 	ssh_event_add_session(event, session);
@@ -597,7 +606,7 @@ main_loop(ssh_channel channel)
 {
 	ssh_session session = ssh_channel_get_session(channel);
 
-	insert_item(channel, fileno(stdin), fileno(stdout));
+	insert_item(channel, fileno(stdin), fileno(stdout), 1);
 
 	ssh_callbacks_init(&channel_cb);
 	ssh_set_channel_callbacks(channel, &channel_cb);
