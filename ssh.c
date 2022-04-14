@@ -35,19 +35,24 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <libssh/libssh.h>
-#include <libssh/callbacks.h>
-#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stddef.h>
-#include <sys/time.h>
-#include <sys/un.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <termios.h>
 #include <time.h>
 
+#include <libssh/libssh.h>
+#include <libssh/callbacks.h>
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+#include <sys/un.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 /*
  * Data Structures and Macros
@@ -89,7 +94,7 @@ static int x11_get_proto(const char *display, char **_proto, char **_data);
 static void set_nodelay(int fd);
 static int connect_local_xsocket_path(const char *pathname);
 static int connect_local_xsocket(int display_number);
-static int x11_connect_display();
+static int x11_connect_display(void);
 
 // Send data to channel
 static int copy_fd_to_channel_callback(int fd, int revents, void *userdata);
@@ -106,6 +111,8 @@ static ssh_channel x11_open_request_callback(ssh_session session, const char *sh
 // Main loop
 static int main_loop(ssh_channel channel);
 
+// Internals
+int64_t _current_timestamp(void);
 
 /*
  * Callbacks Data Structures
@@ -148,10 +155,13 @@ struct termios _saved_tio;
 */
 
 int64_t
-_current_timestamp() {
+_current_timestamp(void) {
 	struct timeval tv;
+	int64_t milliseconds;
+
 	gettimeofday(&tv, NULL);
-	int64_t milliseconds = (int64_t)(tv.tv_sec) * 1000 + (tv.tv_usec / 1000);
+	milliseconds = (int64_t)(tv.tv_sec) * 1000 + (tv.tv_usec / 1000);
+
 	return milliseconds;
 }
 
@@ -160,7 +170,11 @@ _logging_callback(int priority, const char *function, const char *buffer, void *
 {
 	FILE *fp;
 	char buf[100];
+	int64_t milliseconds;
+
 	time_t now = time (0);
+
+	(void)userdata;
 
 	strftime(buf, 100, "%Y-%m-%d %H:%M:%S", localtime (&now));
 
@@ -171,7 +185,7 @@ _logging_callback(int priority, const char *function, const char *buffer, void *
 		exit(-11);
 	}
 
-	int64_t milliseconds = _current_timestamp();
+	milliseconds = _current_timestamp();
 
 	fprintf(fp, "[%s.%jd, %d] %s: %s\n", buf, milliseconds, priority, function, buffer);
 	fclose(fp);
@@ -186,9 +200,13 @@ _enter_term_raw_mode(void)
 		_saved_tio = tio;
 		tio.c_iflag |= IGNPAR;
 		tio.c_iflag &= ~(ISTRIP | INLCR | IGNCR | ICRNL | IXON | IXANY | IXOFF);
+#ifdef IUCLC
 		tio.c_iflag &= ~IUCLC;
+#endif
 		tio.c_lflag &= ~(ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHONL);
+#ifdef IEXTEN
 		tio.c_lflag &= ~IEXTEN;
+#endif
 		tio.c_oflag &= ~OPOST;
 		tio.c_cc[VMIN] = 1;
 		tio.c_cc[VTIME] = 0;
@@ -212,9 +230,10 @@ _leave_term_raw_mode(void)
 static void
 insert_item(ssh_channel channel, int fd_in, int fd_out, int protected)
 {
+	node_t *node_iterator, *new;
+
 	pthread_mutex_lock(&mutex);
 
-	node_t *node_iterator, *new;
 	if (node == NULL) {
 		/* Calloc ensure that node is full of 0 */
 		node = (node_t *) calloc(1, sizeof(node_t));
@@ -245,9 +264,10 @@ insert_item(ssh_channel channel, int fd_in, int fd_out, int protected)
 static void
 delete_item(ssh_channel channel)
 {
+	node_t *current, *previous = NULL;
+
 	pthread_mutex_lock(&mutex);
 
-	node_t *current, *previous = NULL;
 	for (current = node; current; previous = current, current = current->next) {
 		if (current->channel != channel)
 			continue;
@@ -269,9 +289,10 @@ delete_item(ssh_channel channel)
 static node_t *
 search_item(ssh_channel channel)
 {
+	node_t *current = node;
+
 	pthread_mutex_lock(&mutex);
 
-	node_t *current = node;
 	while (current != NULL) {
 		if (current->channel == channel) {
 			pthread_mutex_unlock(&mutex);
@@ -323,7 +344,7 @@ ssh_gai_strerror(int gaierr)
 static int
 x11_get_proto(const char *display, char **_proto, char **_cookie)
 {
-	char cmd[256], line[512], xdisplay[512];
+	char cmd[1024], line[512], xdisplay[512];
 	static char proto[512], cookie[512];
 	FILE *f;
 	int ret = 0, r;
@@ -370,7 +391,7 @@ connect_local_xsocket_path(const char *pathname)
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	addr.sun_path[0] = '\0';
-	strncpy(addr.sun_path + 1, pathname, strlen(pathname));
+	memcpy(addr.sun_path + 1, pathname, strlen(pathname));
 	if (connect(sock, (struct sockaddr *)&addr, offsetof(struct sockaddr_un, sun_path) + 1 + strlen(pathname)) == 0)
 		return sock;
 	close(sock);
@@ -400,16 +421,17 @@ x11_connect_display()
 
 	/* Try to open a socket for the local X server. */
 	display = getenv("DISPLAY");
+
+	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "display: %s", display);
+
 	if (!display) {
 		return -1;
 	}
 
-	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "display: %s", display);
-
 	/* Check if it is a unix domain socket. */
 	if (strncmp(display, "unix:", 5) == 0 || display[0] == ':') {
 		/* Connect to the unix domain socket. */
-		if (sscanf(strrchr(display, ':') + 1, "%u", &display_number) != 1) {
+		if (sscanf(strrchr(display, ':') + 1, "%d", &display_number) != 1) {
 			_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Could not parse display number from DISPLAY: %.100s", display);
 			return -1;
 		}
@@ -429,14 +451,14 @@ x11_connect_display()
 	}
 
 	/* Connect to an inet socket. */
-	strncpy(buf, display, sizeof(buf));
+	strncpy(buf, display, sizeof(buf) - 1);
 	cp = strchr(buf, ':');
 	if (!cp) {
 		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Could not find ':' in DISPLAY: %.100s", display);
 		return -1;
 	}
 	*cp = 0;
-	if (sscanf(cp + 1, "%u", &display_number) != 1) {
+	if (sscanf(cp + 1, "%d", &display_number) != 1) {
 		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Could not parse display number from DISPLAY: %.100s", display);
 		return -1;
 	}
@@ -482,7 +504,7 @@ copy_fd_to_channel_callback(int fd, int revents, void *userdata)
 {
 	ssh_channel channel = (ssh_channel)userdata;
 	char buf[2097152];
-	int sz, ret = 0;
+	int sz = 0, ret = 0;
 
 	node_t *temp_node = search_item(channel);
 
@@ -533,13 +555,16 @@ copy_fd_to_channel_callback(int fd, int revents, void *userdata)
 static int
 copy_channel_to_fd_callback(ssh_session session, ssh_channel channel, void *data, uint32_t len, int is_stderr, void *userdata)
 {
+	node_t *temp_node;
+	int fd, sz;
+
 	(void)session;
 	(void)is_stderr;
 	(void)userdata;
 
-	node_t *temp_node = search_item(channel);
-	int fd = temp_node->fd_out;
-	int sz;
+	temp_node = search_item(channel);
+
+	fd = temp_node->fd_out;
 
 	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "len: %d - fd: %d - is_stderr: %d", len, fd, is_stderr);
 
@@ -552,10 +577,12 @@ copy_channel_to_fd_callback(ssh_session session, ssh_channel channel, void *data
 static void
 channel_close_callback(ssh_session session, ssh_channel channel, void *userdata)
 {
+	node_t *temp_node;
+
 	(void)session;
 	(void)userdata;
 
-	node_t *temp_node = search_item(channel);
+	temp_node = search_item(channel);
 
 	if (temp_node != NULL) {
 		int fd = temp_node->fd_in;
@@ -575,13 +602,16 @@ channel_close_callback(ssh_session session, ssh_channel channel, void *userdata)
 static ssh_channel
 x11_open_request_callback(ssh_session session, const char *shost, int sport, void *userdata)
 {
+	ssh_channel channel;
+	int sock;
+
 	(void)shost;
 	(void)sport;
 	(void)userdata;
 
-	ssh_channel channel = ssh_channel_new(session);
+	channel	= ssh_channel_new(session);
 
-	int sock = x11_connect_display();
+	sock = x11_connect_display();
 
 	_ssh_log(SSH_LOG_FUNCTIONS, __func__, "sock: %d", sock);
 
@@ -644,11 +674,12 @@ main_loop(ssh_channel channel)
  * MAIN
 */
 
-int main()
+int
+main(void)
 {
 	ssh_session session;
-	char *hostname = "127.0.0.1";
-	char *username = "s0n1k";
+	const char *hostname = "127.0.0.1";
+	const char *username = "marco.fortina";
 	char *password;
 
 	const char *compression = "yes";
@@ -656,12 +687,14 @@ int main()
 	int port = 22;
 	int enableX11 = 1; // 0 disabled - 1 enabled
 	int ret;
+	ssh_channel channel;
 
 	const char *display;
 	char *proto = NULL, *cookie = NULL;
 
 	ssh_set_log_callback(_logging_callback);
 	ret = ssh_init();
+	if (ret != SSH_OK) return ret;
 
 	session = ssh_new();
 	if (session == NULL) exit(-1);
@@ -684,7 +717,7 @@ int main()
 		exit(-1);
 	}
 
-	ssh_channel channel = ssh_channel_new(session);
+	channel = ssh_channel_new(session);
 	if (channel == NULL) return SSH_ERROR;
 
 	ret = ssh_channel_open_session(channel);
@@ -697,19 +730,26 @@ int main()
 	if (ret != SSH_OK) return ret;
 
 	if (enableX11 == 1) {
-		ssh_callbacks_init(&cb);
-		ssh_set_callbacks(session, &cb);
-
 		display = getenv("DISPLAY");
-		if (x11_get_proto(display, &proto, &cookie) != 0) {
-			_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Using fake authentication data for X11 forwarding");
-			proto = NULL;
-			cookie = NULL;
-		}
 
-		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "proto: %s - cookie: %s", proto, cookie);
-		ret = ssh_channel_request_x11(channel, 0, proto, cookie, 0);
-		if (ret != SSH_OK) return ret;
+		_ssh_log(SSH_LOG_FUNCTIONS, __func__, "display: %s", display);
+
+		if (display) {
+			ssh_callbacks_init(&cb);
+			ret = ssh_set_callbacks(session, &cb);
+			if (ret != SSH_OK) return ret;
+
+			if (x11_get_proto(display, &proto, &cookie) != 0) {
+				_ssh_log(SSH_LOG_FUNCTIONS, __func__, "Using fake authentication data for X11 forwarding");
+				proto = NULL;
+				cookie = NULL;
+			}
+
+			_ssh_log(SSH_LOG_FUNCTIONS, __func__, "proto: %s - cookie: %s", proto, cookie);
+			// See https://gitlab.com/libssh/libssh-mirror/-/blob/master/src/channels.c#L2062 for details.
+			ret = ssh_channel_request_x11(channel, 0, proto, cookie, 0);
+			if (ret != SSH_OK) return ret;
+		}
 	}
 
 	ret = _enter_term_raw_mode();
