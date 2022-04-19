@@ -114,6 +114,10 @@ static int main_loop(ssh_channel channel);
 // Internals
 int64_t _current_timestamp(void);
 
+// Global variables
+const char *hostname = NULL;
+int enableX11 = 0; // 0 disabled - 1 enabled
+
 /*
  * Callbacks Data Structures
 */
@@ -671,23 +675,66 @@ main_loop(ssh_channel channel)
 
 
 /*
+ * USAGE
+ */
+
+static void
+usage(void)
+{
+	fprintf(stderr,
+		"Usage : ssh-X11-client [options] [login@]hostname\n"
+		"sample X11 client - libssh-%s\n"
+		"Options :\n"
+		"  -l user : Specifies the user to log in as on the remote machine.\n"
+		"  -p port : Port to connect to on the remote host.\n"
+		"  -v      : Verbose mode. Multiple -v options increase the verbosity. The maximum is 5.\n"
+		"  -C      : Requests compression of all data.\n"
+		"  -X      : Enables X11 forwarding.\n"
+		"\n",
+		ssh_version(0));
+
+	exit(0);
+}
+
+static int opts(int argc, char **argv)
+{
+	int i;
+
+	while ((i = getopt(argc,argv,"X")) != -1) {
+		switch(i) {
+		case 'X':
+			enableX11 = 1;
+			break;
+		default:
+			fprintf(stderr, "Unknown option %c\n", optopt);
+			return -1;
+		}
+	}
+
+	if (optind < argc) {
+		hostname = argv[optind++];
+	}
+
+	if (hostname == NULL) {
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
  * MAIN
 */
 
 int
-main(void)
+main(int argc, char **argv)
 {
-	ssh_session session;
-	const char *hostname = "127.0.0.1";
-	const char *username = "marco.fortina";
-	char *password;
+	char *password = NULL;
 
-	const char *compression = "yes";
-	int verbosity = SSH_LOG_FUNCTIONS;
-	int port = 22;
-	int enableX11 = 1; // 0 disabled - 1 enabled
-	int ret;
+	ssh_session session;
 	ssh_channel channel;
+
+	int ret;
 
 	const char *display;
 	char *proto = NULL, *cookie = NULL;
@@ -699,19 +746,25 @@ main(void)
 	session = ssh_new();
 	if (session == NULL) exit(-1);
 
-	ssh_options_set(session, SSH_OPTIONS_HOST, hostname);
-	ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
-	ssh_options_set(session, SSH_OPTIONS_PORT, &port);
-	ssh_options_set(session, SSH_OPTIONS_COMPRESSION, &compression);
+	if (ssh_options_getopt(session, &argc, argv) || opts(argc, argv)) {
+		fprintf(stderr, "Error parsing command line: %s\n", ssh_get_error(session));
+		ssh_free(session);
+		ssh_finalize();
+		usage();
+	}
+
+	if (ssh_options_set(session, SSH_OPTIONS_HOST, hostname) < 0) {
+		return -1;
+	}
 
 	ret = ssh_connect(session);
 	if (ret != SSH_OK) {
-		fprintf(stderr, "Error connecting to %s: %s\n", hostname, ssh_get_error(session));
+		fprintf(stderr, "Connection failed : %s\n", ssh_get_error(session));
 		exit(-1);
 	}
 
 	password = getpass("Password: ");
-	ret = ssh_userauth_password(session, username, password);
+	ret = ssh_userauth_password(session, NULL, password);
 	if (ret != SSH_AUTH_SUCCESS) {
 		fprintf(stderr, "Error authenticating with password: %s\n", ssh_get_error(session));
 		exit(-1);
